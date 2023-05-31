@@ -1,0 +1,1233 @@
+---
+title: "Multimodal freight transport"
+output:
+  html_document:
+    df_print: paged
+---
+
+libraries
+```{r message=FALSE, include=FALSE}
+gc()
+# Load necessary packages
+library(igraph)     # For working with network graphs
+library(GGally)     # For creating pairwise plots
+library(svMisc)     # For miscellaneous functions
+library(ggraph)     # For creating interactive graphs
+library(igraph)     # For working with network graphs
+library(network)    # For working with network graphs
+library(sna)        # For social network analysis functions
+library(tableHTML)  # For creating HTML tables
+library(tidygraph)  # For working with tidy graph data
+library(tidyverse)  # For data manipulation and visualization
+library(tibble)     # For working with tibbles
+library(dplyr)      # For data manipulation
+library(network)    # For working with network graphs
+library(ggplot2)    # For creating plots
+library(visNetwork) # For creating interactive network graphs
+library(networkD3)  # For creating interactive network graphs
+library(netrankr)   # For network analysis functions
+library(CINNA)      # For community detection
+library(mapview)    # For interactive maps
+library(sf)         # For working with spatial data
+library(RColorBrewer) # For color palettes
+library(qualpalr)   # For color palettes
+library(leaflet)    # For creating interactive maps
+library(sp)         # For working with spatial data
+library(shiny)      # For creating interactive web applications
+library(scales)     # For formatting numbers and text
+library(tmap)       # For thematic maps
+
+library(nabor)      # For k-nearest neighbor calculations
+
+# Set mapview options to not display the full geographic background
+mapviewOptions(fgb = FALSE, georaster = FALSE) 
+
+```
+
+Load 
+```{r echo=TRUE}
+
+setwd('/Users/francois-xavier/Desktop/Multimodal network/')
+# Read in the coordinate data from the CSV file and store it in a variable called "coordinates"
+coordinates <- read.csv(file='Coordinates.csv', header=T)
+
+#all ports outside EU have same coordinates per country to compute less routes
+ports <- read.csv(file='Coordinatesaggregated.csv')[,-1]
+
+full_data <- read.csv(file="DummyDataStatistics.csv")
+
+# Read shapefile and convert to sf
+gfg<-st_read("WaterwaysNetwork.shp")
+
+# read in data from a CSV file, excluding the first column
+dataF <- read.csv(file = "DummyDataFreight.csv")[,-1]
+dataF$cd_lod_type<-as.character(dataF$cd_lod_type)
+
+```
+
+create function to prepare 5 data frames : Departures, Arrivals and both, and aggregated by country for dep and arrivals
+```{r echo=FALSE}
+# Define a function called "prepared_dataframes" that takes in 6 arguments: "data", "year", "M", "type", "R", "GroupCountries", and "FocusPort"
+prepared_dataframes <- function(data, year=2018:2022,M=1:12,type="0",R="All",GroupCountries=FALSE,FocusPort="NO") {
+  
+  # Filter the data by year
+  passengersFilter <- filter(data,data$Ms_Yr %in%year)
+  
+  # Further filter the data by month
+  passengersFilter <- filter(passengersFilter,passengersFilter$Ms_Per %in% M)
+  
+  # If a specific type of travel is specified, filter the data by that type
+  if(type!="0"){passengersFilter <- filter(passengersFilter,passengersFilter$cd_lod_type == type)}
+  
+  # If a specific mode of transportation is specified, filter the data by that mode
+  if(R!="All"){passengersFilter <- filter(passengersFilter,passengersFilter$transport_type== R)}
+  
+  # If a specific focus port is specified, filter the data by that port for both source and destination, and then combine the two filtered datasets
+  if(!("NO" %in% FocusPort) ){
+  FilterDestination<-filter(passengersFilter,passengersFilter$Destination %in% FocusPort)
+  FilterSource<-filter(passengersFilter,passengersFilter$Source %in% FocusPort)
+  passengersFilter <- rbind(FilterDestination,FilterSource)
+  }
+  
+  # If the GroupCountries parameter is TRUE, group the data by country and then sum the weightTon values for each unique combination of Destination, Source, cd_lod_type, and transport_type
+  if(GroupCountries==TRUE){
+    for(i in 1:length(passengersFilter$Destination)){
+      if(substr(passengersFilter$Destination[i],1,2)!="BE"){
+        passengersFilter$Destination[i] <- substr(passengersFilter$Destination[i],1,2)
+      }
+    }
+    
+    for(i in 1:length(passengersFilter$Source)){
+      if(substr(passengersFilter$Source[i],1,2)!="BE"){
+        passengersFilter$Source[i] <- substr(passengersFilter$Source[i],1,2)
+      }
+    }
+  }
+  
+  # Order the resulting dataset by Destination and then by Source
+  passengersFilter<- passengersFilter[order(passengersFilter$Destination,passengersFilter$Source),]
+  
+  # Group the data by Destination, Source, cd_lod_type, and transport_type, and then sum the weightTon values for each unique combination of those variables
+  Agg<- aggregate(weightTon  ~ Destination  + Source  + cd_lod_type+transport_type,data=passengersFilter,FUN=sum)
+  
+  # Order the resulting dataset by Destination, Source, cd_lod_type, and transport_type
+  Agg<-Agg[order(Agg$Destination,Agg$Source,Agg$cd_lod_type,Agg$transport_type),]
+  
+  # Remove the passengersFilter object from memory
+  rm(passengersFilter)  
+  
+  # Return the aggregated dataset
+  return(Agg)
+}
+
+
+```
+
+Function return nodes and edges 
+```{r}
+# Function to create nodes and edges for a geo graph
+Nodes_and_Edges <- function(data){
+
+  # Aggregate the total traffic for each destination and source
+  TotalTrafficIn <- aggregate(weightTon ~ Destination, data = data, FUN = sum)
+  TotalTrafficOut <- aggregate(weightTon ~ Source, data = data, FUN = sum)
+  
+  # Rename the Source column to Destination in TotalTrafficOut for merging
+  TotalTrafficOut <- rename(TotalTrafficOut, Destination = Source)
+  
+  # Combine TotalTrafficIn and TotalTrafficOut
+  TotalTraffic <- rbind(TotalTrafficIn, TotalTrafficOut)
+  
+  # Aggregate the total traffic for each destination
+  TotalTraffic <- aggregate(weightTon ~ Destination, data = TotalTraffic, FUN = sum)
+  
+  # Rename columns for nodes
+  TotalTraffic <- rename(TotalTraffic, label = Destination)
+  TotalTraffic <- rename(TotalTraffic, value = weightTon)
+  
+  # Create nodes for sources and destinations
+  sources <- data %>% distinct(Source) %>% rename(label = Source)
+  destinations <- data %>% distinct(Destination) %>% rename(label = Destination)
+  
+  # Merge sources and destinations into a single nodes dataframe
+  nodes <- full_join(sources, destinations, by = "label")
+  
+  # Merge nodes with total traffic dataframe
+  nodes <- merge(x = nodes, y = TotalTraffic, by = "label")
+  
+  # Order nodes by value (total traffic)
+  nodes <- nodes[order(-nodes$value),]
+  
+  # Add id column
+  nodes <- nodes %>% rowid_to_column("id")
+  
+  # Add group1 column
+  nodes$group1 <- substr(nodes$label, 1, 2)
+  
+  # Add title column
+  nodes$title <- paste(nodes$label, " ", nodes$value)
+  
+  # Add group column based on group1
+  nodes$group <- ifelse(nodes$group1 == "BE", "Belgium", ifelse(nodes$group1 == "GB", "GB", "Other"))
+  
+  # Merge nodes with coordinates dataframe
+  nodes <- merge(nodes, coordinates, by = "label", all.x = TRUE)
+  
+  # Order nodes by id
+  nodes <- nodes[order(nodes$id),]
+  
+  # Remove unused columns and replace NA values with defaults
+  nodes <- nodes[,-7]
+  nodes <- replace_na(nodes, list(latitude = -179, longitude = 0))
+  
+  # Convert coordinates to x and y values
+  nodes$x <- 180 * nodes$longitude
+  nodes$y <- -80 * nodes$latitude
+  
+  # Create edges dataframe
+  edges <- data %>%
+    rename(weight = weightTon) %>%
+    rename(destination = Destination) %>%
+    rename(source = Source) %>%
+    left_join(nodes[,1:2], by = c("source" = "label")) %>%
+    rename(from = id) %>%
+    left_join(nodes[,1:2], by = c("destination" = "label")) %>%
+    rename(to = id)
+  
+  # Reorder columns
+  edges <- edges[, c(6, 7, 5, 4, 3, 1, 2)]
+  
+  # Calculate width of edges based on log of weight
+  edges$width <- log(edges$weight, 5) + 1
+  
+  # Add arrows to edges
+  edges$arrows <- "middle"
+
+# Define the list of valid type codes for goods
+typegoodcode <- c("1", "2", "3", "5", "6", "9", "NA")
+
+# Define the corresponding names for each type code
+typegoodname <- c(
+  "Liquid Bulk",
+  "Dry Bulk",
+  "Containers",
+  "RORO self-propelled",
+  "RORO non-self-propelled",
+  "Other general cargo",
+  "NA"
+)
+
+# Combine the type codes and names into a matrix
+typegood <- cbind(typegoodcode, typegoodname)
+
+# Filter out any invalid type codes in the edges data frame and replace with NA
+edges$cd_lod_type[!(edges$cd_lod_type %in% c("1", "2", "3", "5", "6", "9"))] <- NA
+
+# Left join the edges data frame with the typegood matrix based on the cd_lod_type and typegoodcode columns
+# This adds a new column to the edges data frame called typegoodname with the corresponding name for each cd_lod_type
+edges <- left_join(edges, typegood, by = c("cd_lod_type" = "typegoodcode"), copy = TRUE)
+
+# Create a new column in the edges data frame called title
+# This column concatenates several other columns to create a description of each edge
+edges$title <- paste(
+  edges$transport_type,
+  " : ",
+  as.character(edges$weight),
+  "tons ",
+  edges$typegoodname,
+  "From ",
+  edges$source,
+  "to ",
+  edges$destination
+)
+
+# Remove any objects from the environment called destinations and sources
+rm(destinations)
+rm(sources)
+
+# Return a list of nodes and edges
+return(list(nodes, edges))
+}
+
+```
+
+
+Fuction give a location and get evolution of statistics
+```{r}
+# Define a function called 'Evolution_importance_Location' which takes a single argument 'Location'
+Evolution_importance_Location <- function(Location){
+  
+  # Filter the 'full_data' data frame by the 'Location' specified in the function argument and store the result in 'table_Location'
+  
+table_Location  <-    filter(full_data,full_data$label==Location)
+table_Location  <-    filter(table_Location,table_Location$Type=="All")
+
+plot(as.Date(table_Location$date),table_Location$DegreeConnections,type = "o",xlab = "date", ylab = "Degree")
+
+
+
+}
+
+Evolution_importance_Location("BEANR")
+```
+
+
+
+
+```{r}
+
+# Set LENGTH_GEO value to 0.1 for all edges with Type "Canal"
+gfg[gfg$Type=="Canal",]$LENGTH_ <- 0.1 
+edges <- gfg
+
+# Extract start and end coordinates of each edge and assign node IDs
+nodes <- edges %>%
+  st_coordinates() %>%
+  as_tibble() %>%
+  rename(edgeID = L1) %>%
+  group_by(edgeID) %>%
+  slice(c(1, n())) %>%
+  ungroup() %>%
+  mutate(start_end = rep(c('start', 'end'), times = n()/2)) %>%
+  # Create unique node IDs based on X and Y coordinates
+  mutate(xy = paste(.$X, .$Y)) %>% 
+  mutate(nodeID = group_indices(., factor(xy, levels = unique(xy)))) %>%
+  select(-xy)
+
+# Remove duplicate node IDs and convert to sf
+nodes <- nodes %>%
+  distinct(nodeID, .keep_all = TRUE) %>%
+  select(-c(edgeID, start_end)) %>%
+  st_as_sf(coords = c('X', 'Y')) %>%
+  st_set_crs(st_crs(edges))
+
+# Create graph from nodes and edges
+gfg <- tbl_graph(nodes = nodes, edges = as_tibble(edges), directed = FALSE)
+
+# Remove edges and nodes data
+rm(edges)
+rm(nodes)
+
+# Read port coordinates and convert to sf
+
+ports_sf <- st_as_sf(ports, coords = c("longitude","latitude" ), crs = 4326)
+ports_sf <- st_transform(ports_sf, crs = 4326)
+
+# Set Port A and Port B
+PortA <- ports_sf[1397,] 
+PortB <- ports_sf[50,] 
+
+# Get coordinates of Port A and Port B
+coords_o <- PortA %>%
+  st_coordinates() %>%
+  matrix(ncol = 2)
+coords_d <- PortB %>%
+  st_coordinates() %>%
+  matrix(ncol = 2)
+
+# Get coordinates of all nodes in the network
+nodes <- gfg %>%
+  activate(nodes) %>%
+  as_tibble() %>%
+  st_as_sf()
+coords <- nodes %>%
+  st_coordinates()
+
+# Find nearest nodes to Port A and Port B
+node_index_o <- knn(data = coords, query = coords_o, k = 1)
+node_index_d <- knn(data = coords, query = coords_d, k = 1)
+node_o <- nodes[node_index_o$nn.idx,]
+node_d <- nodes[node_index_d$nn.idx,]
+
+# Find shortest path between Port A and Port B
+path <- shortest_paths(
+  graph = gfg,
+  from = node_index_o$nn.idx, # new origin
+  to = node_index_d$nn.idx,   # new destination
+  output = 'both',
+  weights = gfg %>% activate(edges) %>% pull(LENGTH_)
+)
+
+# Create a subgraph with the shortest path
+path_graph <- gfg %>%
+  subgraph.edges(eids = path$epath %>% unlist()) %>%
+  as_tbl_graph()
+
+# Create tmap visualization of the shortest path
+tmap_mode('view')
+
+
+# Add lines to the map representing the edges in the shortest path
+tm_shape(path_graph %>% activate(edges) %>% as_tibble() %>% st_as_sf()) +
+  tm_lines(lwd = 5, col = 'firebrick') +
+  # Add dots to the map representing the nodes in the shortest path
+  tm_shape(path_graph %>% activate(nodes) %>% as_tibble() %>% st_as_sf() ) +
+  tm_dots() +
+  # Set the basemap to OpenStreetMap
+  tmap_options(basemaps = 'OpenStreetMap')
+```
+
+heatmap betweenness
+```{r}
+# Create a ggplot object
+ggplot() +
+
+  # Add the sf object as a layer to the ggplot
+   geom_sf(data = gfg %>% activate(edges) %>% as_tibble() %>% st_as_sf(), aes(col = btwnnss, size = btwnnss))  +
+
+  # Set the color scale to Viridis (option = 'inferno')
+  scale_colour_viridis_c(option = 'inferno') +
+
+  # Set the size scale for the btwnnss column to range from 0 to 4
+  scale_size_continuous(range = c(0,4))
+
+
+```
+
+
+assign a path to a pair from data F
+```{r}
+
+# define a function called GetPaths that takes in two arguments: data and network
+GetPaths <- function(data, network) {
+  
+  # activate the nodes in the network, convert to a tibble, and convert to an sf object
+  nodes <- network %>%
+    activate(nodes) %>%
+    as_tibble() %>%
+    st_as_sf()
+  
+  # get the coordinates of the nodes
+  coords <- nodes %>%
+    st_coordinates()
+  
+  # initialize an empty variable called path_graphF
+  path_graphF <- NULL
+  
+  # remove the first row from node_o and node_d
+  node_ox <- node_o[-1,]
+  node_dx <- node_d[-1,]
+  
+  # loop over each row of the data
+  for (i in 1:length(data$Destination)) {
+    
+    # get the coordinates of the destination port
+    coords_d <- ports_sf[ports_sf$label == data$Destination[i],] %>%
+      st_coordinates() %>%
+      matrix(ncol = 2)
+    
+    # if the destination port is not found and doesn't start with certain letters, use the first port that starts with the same two letters
+    if (is.na(coords_d[1]) && !substr(data$Destination[i], 1, 2) %in% c("ZZ","XX","LN","HE")) {
+      coords_d <- ports_sf[substr(ports_sf$label, 1, 2) == substr(data$Destination[i], 1, 2), ][1,] %>%
+        st_coordinates() %>%
+        matrix(ncol = 2)
+    }
+    
+    # if the destination port is still not found, use a default location
+    if (is.na(coords_d[1])) {
+      coords_d <- matrix(ncol = 2,c(0,80))
+    }
+    
+    # get the coordinates of the source port
+    coords_o <- ports_sf[ports_sf$label == data$Source[i],] %>%
+      st_coordinates() %>%
+      matrix(ncol = 2)
+    
+    # if the source port is not found and doesn't start with certain letters, use the first port that starts with the same two letters
+    if (is.na(coords_o[1]) && !substr(data$Source[i], 1, 2) %in% c("ZZ","XX","LN","HE")) {
+      coords_o <- ports_sf[substr(ports_sf$label, 1, 2) == substr(data$Source[i], 1, 2), ][1,] %>%
+        st_coordinates() %>%
+        matrix(ncol = 2)
+    }
+    
+    # if the source port is still not found, use a default location
+    if (is.na(coords_o[1])) {
+      coords_o <- matrix(ncol = 2,c(0,80))
+    }
+    
+    # find the index of the nearest node to the source and destination ports
+    node_index_o <- knn(data = coords, query = coords_o, k = 1)
+    node_index_d <- knn(data = coords, query = coords_d, k = 1)
+    
+    # get the node corresponding to the index
+    node_o <- nodes[node_index_o$nn.idx, ]
+    node_d <- nodes[node_index_d$nn.idx, ]
+    
+   
+
+  
+      # find the shortest path between the source and destination nodes
+    path <- shortest_paths(
+      graph = network,
+      from = node_index_o$nn.idx, # new origin
+      to = node_index_d$nn.idx,   # new destination
+      output = 'both',
+      weights = network %>% activate(edges) %>% pull(LENGTH_)
+    )
+    
+    # create a subgraph containing only the edges in the shortest path
+    path_graph <- network %>%
+      subgraph.edges(eids = path$epath %>% unlist()) %>%
+      as_tbl_graph()%>%
+      activate(edges) %>%
+      as_tibble() %>%
+      st_as_sf()
+    
+    # add columns to the subgraph with information about the shipment
+    path_graph$Destination <- data$Destination[i]
+    path_graph$Source <- data$Source[i]
+    path_graph$cd_lod_type <- data$cd_lod_type[i]
+    path_graph$Ms_Yr <- data$Ms_Yr[i]
+    path_graph$Ms_Per <- data$Ms_Per[i]
+    path_graph$weightTon <- data$weightTon[i]
+    path_graph$transport_type <- data$transport_type[i]
+    
+    # add the subgraph to the overall path graph variable
+    path_graphF <- rbind(path_graphF, path_graph)
+    
+    # update the node labels for the source and destination nodes
+    node_o$label <- data$Source[i]
+    node_ox <- rbind(node_ox, node_o)
+    node_d$label <- data$Destination[i]
+    node_dx <- rbind(node_dx, node_d)
+    
+    # display progress
+    progress(i, length(data$Destination))
+  }
+  
+  # merge the path graph with a table containing the sum of PassedTons for each edge
+  path_graphF <- merge(
+    x = path_graphF,
+    y = stats::aggregate(list(PassedTons = path_graphF$weightTon), list(edgeID = path_graphF$edgeID), sum),
+    by = "edgeID"
+  )
+  
+  
+  # create a color palette based on the log of the PassedTons values
+  pal <- colorNumeric(
+    palette = "Blues",
+    domain = log(path_graphF$PassedTons)
+  )
+  
+  # create a leaflet map with the path graph and node locations
+  l <- leaflet() %>% 
+    addTiles() %>% 
+    addPolylines(data = path_graphF$geometry, color = pal(log(path_graphF$PassedTons)), stroke = T, label = path_graphF$PassedTons) %>% 
+    addMarkers(data = node_ox$geometry, popup = node_ox$label)
+ 
+  
+   
+  edges <- path_graphF[,c(-1)] %>%
+  mutate(edgeID = c(1:n()))
+
+
+nodes <- edges %>%
+  st_coordinates() %>%
+  as_tibble() %>%
+  rename(edgeID = L1) %>%
+  group_by(edgeID) %>%
+  slice(c(1, n())) %>%
+  ungroup() %>%
+  mutate(start_end = rep(c('start', 'end'), times = n()/2))
+
+
+
+nodes <- nodes %>%
+  mutate(xy = paste(.$X, .$Y)) %>% 
+  mutate(nodeID = group_indices(., factor(xy, levels = unique(xy)))) %>%
+  select(-xy)
+
+
+
+source_nodes <- nodes %>%
+  filter(start_end == 'start') %>%
+  pull(nodeID)
+
+target_nodes <- nodes %>%
+  filter(start_end == 'end') %>%
+  pull(nodeID)
+
+edges = edges %>%
+  mutate(from = source_nodes, to = target_nodes)
+edges$width<-log(edges$PassedTons)
+
+
+nodes <- nodes %>%
+  distinct(nodeID, .keep_all = TRUE) %>%
+  select(-c(edgeID, start_end)) %>%
+  st_as_sf(coords = c('X', 'Y')) %>%
+  st_set_crs(st_crs(edges))
+
+gfgsmall = tbl_graph(nodes = nodes, edges = as_tibble(edges), directed = FALSE)
+gfgsmall <- gfgsmall  %>%
+  activate(nodes) %>%
+  mutate(closeness = centrality_betweenness(weights = PassedTons))
+
+
+
+colnames(nodes)<-c("id","geometry")
+
+
+v<-visNetwork(nodes,
+           edges) %>%
+  visPhysics(stabilization = T)%>% 
+          visIgraphLayout(layout="layout_with_fr")
+
+  # return the leaflet map
+  return(list(l,v,gfgsmall))
+}
+
+
+
+
+GetPaths(dataF[sample(nrow(dataF),100),],gfg)
+
+
+```
+
+
+Launch Shiny App
+```{r}
+
+# Define choices for selectInput elements
+choiceFilter <- append("NO", unique(full_data$label))
+
+choiceRegrion <- c("All", "MAR", "Inl")
+names(choiceRegrion) <-
+  c("Multimodal", "Sea Transport", "Inlands Transport")
+
+choiceLayout <- c("layout_with_fr", "layout_in_circle", "layout_nicely")
+names(choiceLayout) <-
+  c("Normal", "Circle", "Map")
+
+choiceGood <- c("0", "1", "2", "3", "5", "6", "8")
+names(choiceGood) <- c(
+  "All",
+  "Liquid Bulk",
+  "Dry Bulk",
+  "Containers",
+  "RORO self-propelled",
+  "RORO non-self-propelled",
+  "Other general cargo"
+)
+
+# Define legend for Sankey diagrams
+
+A<-c("Liquid Bulk",
+     "Dry Bulk",
+     "Containers")
+B<-c("RORO self-propelled",
+     "RORO non-self-propelled",
+     "Other general cargo")
+
+legend<- rbind(A,B)
+
+legend <- as.data.frame(legend)
+names(legend)<-c("","","")
+
+# Define color scheme for Sankey diagrams
+my_color <- 'd3.scaleOrdinal() .domain([
+  "1", "2", "3", "5", "6", "9","Belgium","GB","Other"]) .range([
+  "#A9BD95", "#BA4682", "#E7CB71", "#F47B5B", "#3079ab","#7d669e", "blue","red","grey"])'
+
+# Define function to generate HTML table with specified formatting
+generate_table_html <- function(data) {
+  # Generate table HTML with specified formatting
+  tableHTML(data, rownames = FALSE, border = 0, collapse = 'separate', spacing = "75px 2px") %>%
+    add_css_rows_in_column(css = list('color', 
+                                      rep(c('#A9BD95', '#F47B5B'))),
+                           column = 1) %>%
+    add_css_rows_in_column(css = list('color', 
+                                      rep(c('#BA4682', '#3079ab'))),
+                           column = 2) %>%
+    add_css_rows_in_column(css = list('color', 
+                                      rep(c('#E7CB71', '#7d669e'))),
+                           column = 3) %>% 
+    add_css_row(css = list(c('font-size', 'text-align', 'font-weight', 'font-family'),
+                           c('12px', 'left', 'bold', 'verdana')))
+}
+
+
+
+# Define server function to handle user input and render outputs
+server <- function(input, output, session) {
+  
+  # Render legend table for Sankey diagrams
+  output$mytable <- render_tableHTML(generate_table_html(legend))
+              
+  output$mytable2 <-render_tableHTML(generate_table_html(legend))
+  
+  # Observe input changes and update outputs accordingly
+  observeEvent(c(input$action,input$rangeYear,input$rangeMonth,input$LayoutType), {
+    # Set variables for the selected values in the input fields
+    yearA <- input$rangeYear
+    MA <- input$rangeMonth[1]:input$rangeMonth[2]
+    typeA <- input$Type
+    RA <- input$Region
+    FocusPortA <- input$FilterPort
+    GroupCountriesA <- input$GroupC
+    LayoutA <- input$LayoutType
+  
+    # Use tryCatch() to handle errors that might arise when creating the data frames
+    tryCatch({
+      # Call the prepared_dataframes() function to create the data frame
+      DF <- prepared_dataframes(
+      dataF,
+      year = yearA,
+      M = MA,
+      type = typeA,
+      R = RA,
+      FocusPort = FocusPortA,
+      GroupCountries = GroupCountriesA
+    )
+      # If a warning is raised, show it in the notification panel
+      
+    },
+    warning = function(warn) {
+      showNotification(paste0(warn), type = "warning")
+    },
+    # If an error is raised, show it in the notification panel
+    error = function(err) {
+      showNotification(paste0(err), type = "err")
+    })
+    
+    
+    
+    # Use tryCatch() to handle errors that might arise when creating the nodes data frame
+    tryCatch({
+      # Call the Nodes_and_Edges() function to create the nodes data frame
+      nodes <- Nodes_and_Edges(DF)[[1]]
+    },
+    # If a warning is raised, show it in the notification panel
+    warning = function(warn) {
+      showNotification(paste0(warn), type = "warning")
+    },
+    # If an error is raised, show it in the notification panel
+    error = function(err) {
+      showNotification(paste0(err), type = "err")
+    })
+    
+    
+    # Use tryCatch() to handle errors that might arise when creating the edges data frame
+    tryCatch({
+      # Call the Nodes_and_Edges() function to create the edges data frame
+      edges <- Nodes_and_Edges(
+        DF)[[2]]
+    },
+    # If a warning is raised, show it in the notification panel
+    warning = function(warn) {
+      showNotification(paste0(warn), type = "warning")
+    },
+    # If an error is raised, show it in the notification panel
+    error = function(err) {
+      showNotification(paste0(err), type = "err")
+    })
+    
+    
+    # Use tryCatch() to handle errors that might arise when updating the "Focus" select input
+    tryCatch({
+      # Set choicesZ to the nodes data frame's "id" column and set the names to the nodes data frame's "label" column
+      choicesZ <- nodes$id
+      names(choicesZ) <- nodes$label
+      # Can also set the label and select items
+      updateSelectInput(session, "Focus",
+                        choices = choicesZ)
+    },
+    warning = function(warn) {
+      showNotification(paste0(warn), type = "warning")
+    },
+    error = function(err) {
+      showNotification(paste0(err), type = "err")
+    })
+    
+    
+    
+    tryCatch({
+      # Define the visNetwork output "mynetworkid" using renderVisNetwork
+      output$mynetworkid <- renderVisNetwork({
+       
+        
+        # Create a visNetwork object with the nodes and edges data frames
+        visNetwork(nodes,
+                   edges,
+                   main = paste(
+                     "Nodes: ",
+                     as.character(length(nodes$label)),
+                     " Edges: ",
+                     as.character(length(edges$to))
+                   )) %>%
+          visPhysics(stabilization = FALSE) %>% 
+          visIgraphLayout(layout = LayoutA)
+      })
+    },
+    warning = function(warn) {
+      showNotification(paste0(warn), type = "warning")
+    },
+    error = function(err) {
+      showNotification(paste0(err), type = "err")
+    })
+    
+    tryCatch({
+      # Define the sankeyNetwork output "SankeyExport" using renderSankeyNetwork
+      output$SankeyExport <- renderSankeyNetwork({
+        # Filter the data frame DF to include only rows where the Destination is in FocusPortA
+        DFexport <- filter(DF, DF$Destination  %in% FocusPortA)
+        
+        # Extract the nodes and edges for the sankey diagram from the filtered DF
+        bExp <- Nodes_and_Edges(DFexport)
+        nodesExp <- bExp[[1]]
+        edgesExp <- bExp[[2]]
+        
+        # Mutate nodes data frame to adjust id column by subtracting 1
+        nodes_d3Exp <- mutate(nodesExp, id = id - 1)
+        
+        # Mutate edges data frame to adjust from and to columns by subtracting 1
+        edges_d3Exp <- mutate(edgesExp, from = from - 1, to = to - 1)
+        
+        # Create sankey diagram using networkD3::sankeyNetwork
+        sankeyExp <- sankeyNetwork(Links = edges_d3Exp, Nodes = nodes_d3Exp, 
+                                   Source = "from", Target = "to", 
+                                   NodeID = "label", NodeGroup = "group", LinkGroup = "cd_lod_type",
+                                   Value = "weight", nodePadding = 15, fontSize = 20, 
+                                   unit = "Tons", colourScale = my_color)
+        
+        # Add title column from edges_d3Exp as hover text for links in sankey diagram
+        sankeyExp$x$links$title <- edges_d3Exp$title
+        
+        # Use htmlwidgets::onRender to specify anonymous function that sets hover text for links
+        sankeyExp <- htmlwidgets::onRender(
+          sankeyExp,
+          '
+    function(el, x) {
+      d3.selectAll(".link").select("title foreignObject body pre")
+      .text(function(d) { return d.title; });
+    }
+    '
+        )
+        
+        # Return modified sankey diagram
+        sankeyExp
+
+      })
+    },
+    warning = function(warn) {
+      showNotification(paste0(warn), type = "warning")
+    },
+    error = function(err) {
+      showNotification(paste0(err), type = "err")
+    })
+    
+    
+    tryCatch({
+      
+      output$SankeyImport <- renderSankeyNetwork({
+        # Filter DF to include only rows where Destination is in FocusPortA
+        DFImport <- filter(DF, DF$Source  %in% FocusPortA)
+        
+        # Extract nodes and edges for sankey diagram from filtered DF
+        bImport <- Nodes_and_Edges(DFImport)
+        nodesImport <- bImport[[1]]
+        edgesImport <- bImport[[2]]
+        
+        # Mutate nodes data frame to adjust id column by subtracting 1
+        nodes_d3Import <- mutate(nodesImport, id = id - 1)
+        
+        # Mutate edges data frame to adjust from and to columns by subtracting 1
+        edges_d3Import <- mutate(edgesImport, from = from - 1, to = to - 1)
+        
+        # Create sankey diagram using networkD3::sankeyNetwork
+        sankeyImport <- sankeyNetwork(Links = edges_d3Import, Nodes = nodes_d3Import, 
+                                      Source = "from", Target = "to", 
+                                      NodeID = "label", NodeGroup = "group", LinkGroup = "cd_lod_type",
+                                      Value = "weight", nodePadding = 15, fontSize = 20, 
+                                      unit = "Tons", colourScale = my_color)
+        
+        # Add title column from edges_d3Import as hover text for links in sankey diagram
+        sankeyImport$x$links$title <- edges_d3Import$title
+        
+        # Use htmlwidgets::onRender to specify anonymous function that sets hover text for links
+        sankeyImport <- htmlwidgets::onRender(
+          sankeyImport,
+          '
+    function(el, x) {
+      d3.selectAll(".link").select("title foreignObject body pre")
+      .text(function(d) { return d.title; });
+    }
+    '
+        )
+        
+        # Return modified sankey diagram
+        sankeyImport
+    })
+      },
+    warning = function(warn) {
+      showNotification(paste0(warn), type = "warning")
+    },
+    error = function(err) {
+      showNotification(paste0(err), type = "err")
+    })
+    
+    output$map <- renderLeaflet({
+     
+      GetPaths(DF,gfg)[[1]]
+     })
+    
+    output$Stats <-
+      renderPlot(Evolution_importance_Location(input$FilterPort[1]))
+  })
+  
+  
+  
+  output$Time <- renderPlot({
+    table_Location <-
+      filter(full_data, full_data$label %in% input$FilterPort)
+    ggplot(table_Location,
+           aes(x = as.Date(date), y = Degree_Centrality),
+           color = label) +
+      geom_line(aes(group = label, color = label)) +
+      stat_summary(
+        fun = mean,
+        na.rm = T,
+        alpha = 1,
+        color = "black",
+        size = 1,
+        geom = "point",
+      ) +
+      theme_bw() +
+      labs(x = "date", y = "Degree_Centrality",
+           color = NULL) +
+      theme(legend.position = "bottom")+
+      geom_vline(xintercept = as.Date("2020-01-01"),
+          linetype="solid", color = "red", size=1.5)+
+      annotate("text", x= as.Date("2020-04-01"), y=max(table_Location$Degree_Centrality), label= "Brexit",size=5)
+  })
+  
+  
+  
+  
+  
+  
+  
+  observe({
+    tryCatch(
+      visNetworkProxy("mynetworkid") %>%
+        visFocus(id = input$Focus, scale = 4),
+      error = function(e) {
+        showNotification(paste("Error: ", e$message), type = "error")
+      }
+    )
+  })
+}
+
+
+# Define pastel color palette
+color_1 <- "#E8E8E8"  # Background color
+color_2 <- "#F8F8F8"  # Panel background color
+color_3 <- "#6D6D6D"  # Text color
+color_4 <- "#CCCCCC"  # Border color
+color_5 <- "#FFFFFF"  # Element background color
+
+# Set font family
+font_family <- "Verdana"
+
+
+ui <- fluidPage(
+  titlePanel("Dashboard Multimodal Transport Belgian Ports"),
+  # Set background color and font family for the entire page
+  style = paste0("background-color: ", color_1, "; font-family: ", font_family,"; font-size: 12px;"),
+  sidebarLayout(
+    position = "left",
+    sidebarPanel(width=3,
+                 tags$style(
+                   "div.shiny-input-container { margin: 0; padding: 0; }"  # reduce margin and padding of div elements
+                 ),
+      # Set font color and font family for the selectInput elements
+      style = paste0("color: ", color_3, "; font-family: ", font_family),
+      selectInput(
+        "FilterPort",
+        "Filter on Port :",
+        choices = choiceFilter,
+        multiple = TRUE,
+        selected="NO"
+      ),
+      selectInput("GroupC", "Group Countries together :", choices = c(TRUE, FALSE)),
+      selectInput("Region", "Region :", choices = choiceRegrion),
+      selectInput(
+        "Type",
+        "Type of good :",
+        choices = choiceGood,
+        selected = "1"
+      ),
+      sliderInput(
+        "rangeYear",
+        label = "Choose a year:",
+        min = 2018,
+        max = 2022,
+        value = 2018,
+        sep = "",
+        animate=TRUE
+      ),
+      sliderInput(
+        "rangeMonth",
+        label = "Choose a start and end Month:",
+        min = 1,
+        max = 12,
+        value = c(1, 12),
+        sep = "",
+        animate = TRUE
+      ),
+      actionButton("action", "New Graph")
+    ),
+    mainPanel(tags$style(
+      "div.shiny-input-container { margin: 0; padding: 0; }"  # reduce margin and padding of div elements
+    ),
+      # Use fluidRow and column to create a responsive layout
+      fluidRow(tags$style(
+        "div.shiny-input-container { margin: 0; padding: 0; }"  # reduce margin and padding of div elements
+      ),
+        column(width = 12,
+               tabsetPanel(
+                 tabPanel(
+                   "Graph Network",
+                   # Set font color and font family for the selectInput element
+                   style = paste0("color: ", color_3, "; font-family: ", font_family),
+                   selectInput("Focus", "Focus on node :", choices = 1),
+                   selectInput("LayoutType", "Layout Network", choices = choiceLayout),
+                   visNetworkOutput("mynetworkid", height = "400px", width = "700px"),
+                   # Set background color for the tabPanel
+                   style = paste0("background-color: ", color_1, ";")
+                 ),
+                tabPanel("SankeyImport",
+                          tableHTML_output("mytable"),
+                          sankeyNetworkOutput("SankeyImport"),
+                          # Set background color for the tabPanel
+                          style = paste0("background-color: ", color_1, ";")),
+                tabPanel("SankeyExport", 
+                          tableHTML_output("mytable2"),
+                          sankeyNetworkOutput("SankeyExport"),
+                          style = "background-color: #eeeeee;"),
+                tabPanel("Map", leafletOutput("map"),
+                          style = "background-color: #eeeeee;"),
+                tabPanel("Statistics",
+                          plotOutput("Stats", height = "500px", width = "700px"),
+                          style = "background-color: #eeeeee;"
+                          )
+                
+               )
+        )
+      )
+    )))
+                          
+
+runApp(shinyApp(ui = ui, server = server),launch.browser = TRUE)
+
+```
+
+Case study 1: Brexit
+```{r}
+#port of Ghent somtimes misscoded
+full_data <- full_data %>%
+  mutate(label = str_replace_all(label, "BEGEN", "BEGNE"))
+#Degree and number of nodes per country
+for (type in types){
+  # Filter the data for the current type
+  table_Location <- filter(full_data, substr(full_data$label,1,2) %in% c("GB","IE","BE"))
+  table_Location <- filter(table_Location, table_Location$Type ==type )
+  # Add new column for period
+  table_Location <- table_Location %>%
+    mutate(period = if_else(as.Date(date) < as.Date("2020-01-01"), "Before 2020", "After 2020"))
+  
+  label_counts <- table_Location %>%
+    group_by(date, group1) %>%
+    summarise(n = n_distinct(label))
+  
+  # Merge the count data back to the original data frame
+  table_Location <- left_join(table_Location, label_counts, by = c("date", "group1"))
+  table_Location$group1[  table_Location$group1=="GB"]<-"UK"
+  
+
+plot <- ggplot(table_Location, aes(x = as.Date(date))) +
+  
+  # Add a line for each group1 group, grouped and coloured by the group1 column
+  stat_summary(aes(y = DegreeConnections, group = group1,color="DegreeConnections"), fun = mean, na.rm = TRUE, geom = 'line') +
+
+  # Add line for the number of labels in each group with a linear trend line
+  geom_line(aes(y = n, group = group1,color="n"), linetype = "solid") +
+
+  # Add manual color settings
+  scale_color_manual(values = c("DegreeConnections" = "blue", "n" = "darkgreen"), labels = c("Average number of connections per port", "Amount of ports")) +
+  
+  # Set the theme to a white background and the x- and y-axis labels to "date" and "Number of Connections", respectively, while removing the colour legend label and moving the legend to the bottom of the plot
+  theme_bw() +
+  labs(x = '', y = "",
+       color = "Legend") +
+  theme(legend.position = 'bottom') +
+  geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted", size = 1.5, colour = "red") +
+  ggtitle(type) +
+  
+  # Create a separate graph for each group with individual y-axis scales
+  facet_wrap(~group1, nrow = 3, scales = "free")
+
+print(plot)
+}
+
+
+#Volume per country 
+for (type in types){
+  # Filter the data for the current type
+  table_Location <- filter(full_data, substr(full_data$label,1,2) %in% c("GB","IE","BE"))
+  table_Location <- filter(table_Location, table_Location$Type ==type )
+# Add new column for period
+table_Location <- table_Location %>%
+  mutate(period = if_else(as.Date(date) < as.Date("2020-01-01"), "Before 2020", "After 2020"))
+
+# Plot
+plot <- ggplot(table_Location, aes(x = as.Date(date), y = value/1000, color = group1)) +
+  
+  # Add a line for each group1 group, grouped and coloured by the group1 column
+  stat_summary(aes(group = group1), fun = sum, na.rm = TRUE, geom = 'line') +
+  
+  
+  # Set the theme to a white background and the x- and y-axis labels to "date" and "Number of Connections", respectively, while removing the colour legend label and moving the legend to the bottom of the plot
+  theme_bw() +
+  labs(x = '', y = "Tonnage", color = NULL) +
+  theme(legend.position = 'bottom') +
+  geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted", size = 1.5, colour = "red") +
+  ggtitle(type)
+
+print(plot)
+}
+
+
+
+
+
+# Degree in Belgium : "BEGNE","BEZEE","BEANR","BEOST"
+for (type in types){
+  # Filter the data for the current type
+  table_Location <- filter(full_data, full_data$label %in% c("BEGNE","BEZEE","BEANR","BEOST"))
+  table_Location <- filter(table_Location, table_Location$Type ==type )
+  # Add new column for period
+  table_Location <- table_Location %>%
+    mutate(period = if_else(as.Date(date) < as.Date("2020-02-01"), "Before 2020", "After 2020"))
+  
+  
+  plot <- ggplot(table_Location, aes(x = as.Date(date), y = DegreeConnections)) +
+    
+    # Add a line for each label group, grouped and coloured by the label column
+    geom_line(aes(group = label, color = label)) +
+    #geom_smooth(aes(group = interaction(label, period), color = label), method = "lm", se = T, linetype = "dashed", size = 0.6) +
+    
+    # Set the theme to a white background and the x- and y-axis labels to "date" and "Tonnage", respectively, while moving the legend to the bottom of the plot
+    theme_bw() +
+    scale_color_manual(values = c("BEZEE"="blue","BEOST"="red","BEANR"="darkgreen","BEGNE"="orange"), labels = c("Zeebrugge", "Ostende ","Antwerp","Ghent")) +
+    labs(x = '', y = "Number of connections", color = "Location") +
+    theme(legend.position = 'bottom') +
+    geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted", size = 1.5, colour = "red") +
+    ggtitle(type)
+  
+  print(plot)
+}
+
+for (type in types){
+  # Filter the data for the current type
+  table_Location <- filter(full_data, full_data$label %in% c("IEDUB","IEORK","IELMK","IEDRO","IEWAT"))
+  table_Location <- filter(table_Location, table_Location$Type ==type )
+  # Add new column for period
+  table_Location <- table_Location %>%
+    mutate(period = if_else(as.Date(date) < as.Date("2020-02-01"), "Before 2020", "After 2020"))
+  
+  
+  plot <- ggplot(table_Location, aes(x = as.Date(date), y = DegreeConnections)) +
+    
+    # Add a line for each label group, grouped and coloured by the label column
+    geom_line(aes(group = label, color = label)) +
+    #geom_smooth(aes(group = interaction(label, period), color = label), method = "lm", se = T, linetype = "dashed", size = 0.6) +
+    
+    # Set the theme to a white background and the x- and y-axis labels to "date" and "Tonnage", respectively, while moving the legend to the bottom of the plot
+    theme_bw() +
+    scale_color_manual(values = c("IEDUB"="blue","IEORK"="red","IEDRO"="darkgreen","IELMK"="orange","IEWAT"="purple"), labels = c("Dublin", "Cork ","Drogheda","Limerick","Waterford")) +
+    labs(x = '', y = "Number of connections", color = "Location") +
+    theme(legend.position = 'bottom') +
+    geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted", size = 1.5, colour = "red") +
+    ggtitle(type)
+  
+  print(plot)
+}
+
+
+
+for (type in types){
+  # Filter the data for the current type
+  table_Location <- filter(full_data, full_data$label %in% c("GBLON","GBIMM","GBFOR","GBFXT","GBHUL","GBSOU"))
+  table_Location <- filter(table_Location, table_Location$Type ==type )
+  # Add new column for period
+  table_Location <- table_Location %>%
+    mutate(period = if_else(as.Date(date) < as.Date("2020-02-01"), "Before 2020", "After 2020"))
+  
+  
+  plot <- ggplot(table_Location, aes(x = as.Date(date), y = DegreeConnections)) +
+    
+    # Add a line for each label group, grouped and coloured by the label column
+    geom_line(aes(group = label, color = label)) +
+    #geom_smooth(aes(group = interaction(label, period), color = label), method = "lm", se = T, linetype = "dashed", size = 0.6) +
+    
+    # Set the theme to a white background and the x- and y-axis labels to "date" and "Tonnage", respectively, while moving the legend to the bottom of the plot
+    theme_bw() +
+    scale_color_manual(values = c("GBLON"="blue","GBIMM"="red","GBFOR"="green","GBFXT"="orange","GBHUL"="purple","GBSOU"="darkgreen"), labels = c("London", "Immingham ","Forth","Felixstowe","Hull","Southapton")) +
+    labs(x = '', y = "Number of connections", color = "Location") +
+    theme(legend.position = 'bottom') +
+    geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted", size = 1.5, colour = "red") +
+    ggtitle(type)
+  
+  print(plot)
+}
+
+
+```
+
+
+Case study 2: node removal
+```{r}
+graph_without_node <- gfg %>%
+  activate(nodes) %>%
+  filter(!nodeID   %in% c(6649,6640,6673,6562)) %>%
+  as_tbl_graph()
+
+
+components <- graph_without_node %>%
+  activate(nodes) %>%
+  mutate(cluster = group_components()) 
+
+# Filter the original graph to only include the largest connected component
+largest_component <- components %>%
+  activate(nodes) %>%
+  filter(cluster %in% 1)
+
+
+pp1<- GetPaths(prepared_dataframes(dataF, year=2020,M=3,type="0",
+                                   R="All",GroupCountries=FALSE,FocusPort="BEGNK"),gfg)
+pp2 <- GetPaths(prepared_dataframes(dataF, year=2020,M=3,type="0",
+                             R="All",GroupCountries=FALSE,FocusPort="BEGNK"),largest_component)
+
+pp1[[1]]
+pp1[[2]]
+tmap_mode('view')
+
+tm_shape(pp1[[3]] %>% activate(edges) %>% as_tibble() %>% st_as_sf()) +
+  tm_lines(lwd = 5, col = 'firebrick') +
+  tm_shape(pp1[[3]] %>% activate(nodes) %>% as_tibble() %>% st_as_sf() ) +
+  tm_symbols(size = 0.0002, col = "closeness", shape = 19) +
+  tmap_options(basemaps = 'OpenStreetMap')
+
+
+tmap_mode('view')
+
+tm_shape(pp2[[3]] %>% activate(edges) %>% as_tibble() %>% st_as_sf()) +
+  tm_lines(lwd = 5, col = 'firebrick') +
+  tm_shape(pp2[[3]] %>% activate(nodes) %>% as_tibble() %>% st_as_sf() ) +
+  tm_symbols(size = 0.0002, col = "closeness", shape = 19) +
+  tmap_options(basemaps = 'OpenStreetMap')
+
+```
+
